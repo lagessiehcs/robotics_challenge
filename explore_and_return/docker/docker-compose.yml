@@ -1,0 +1,21 @@
+services:
+  challenge:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: explore_and_return_challenge
+    stdin_open: true
+    tty: true
+    network_mode: host  # simplest way to get ROS2 DDS discovery working across `docker exec` sessions
+    environment:
+      - DISPLAY=${DISPLAY}
+      - ROS_DOMAIN_ID=42  # isolate from other DDS participants on the network — see Dockerfile
+    volumes:
+      # whole challenge dir as one mount (ws/, eval_runner.sh, results/, ...) so
+      # edits/results flow straight to the host and nothing needs to pre-exist —
+      # a single-file or single-subdir bind mount breaks if its target is missing
+      # or gets replaced (e.g. an editor's atomic save unlinks + recreates it).
+      - ..:/challenge
+      - ../../maps:/challenge/maps
+      - /tmp/.X11-unix:/tmp/.X11-unix  # for RViz — run `xhost +local:docker` on the host first
+    working_dir: /challenge/ws

@@ -1,0 +1,2028 @@
+"""Your task: replace the EXPLORING state's body (marked below) with real
+exploration + coverage logic. Everything else in this file is infrastructure
+you're free to use as-is, restructure, or throw away entirely — the only
+external contract that matters is:
+
+  - subscribe /map (nav_msgs/OccupancyGrid) — published live by slam_toolbox
+  - send goals via the /navigate_to_pose action (nav2_msgs/action/NavigateToPose)
+  - call the /finish_exploration service (std_srvs/srv/Trigger) when done
+
+See README.md for the full brief and scoring rubric.
+
+Note: "home" is the odom frame's origin (see get_home_pose_in_map_frame
+below) — re-derive its pose in the map frame every time you need it, don't
+cache it from t=0. slam_toolbox corrects the map->odom transform as it
+refines the pose graph, so where home sits in the map frame can drift over a
+run even though the robot itself never moves in the odom frame.
+"""
+from __future__ import annotations
+
+import math
+from collections import deque
+
+import rclpy
+import tf2_ros
+from action_msgs.msg import GoalStatus
+from geometry_msgs.msg import PoseStamped, Quaternion
+from nav_msgs.msg import OccupancyGrid
+from nav2_msgs.action import ComputePathToPose, NavigateToPose
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from std_srvs.srv import Trigger
+
+
+def yaw_to_quaternion(yaw: float) -> Quaternion:
+    q = Quaternion()
+    q.z = math.sin(yaw / 2.0)
+    q.w = math.cos(yaw / 2.0)
+    return q
+
+
+class ExplorerNode(Node):
+    def __init__(self) -> None:
+        super().__init__("candidate_explorer")
+
+        self.obstacle_distance_map = None
+        self.obstacle_distance_map_version = 0
+        self.map_version = 0
+
+        self._path_check_in_progress = False
+
+        self.no_frontier_since = None
+        self.no_frontier_timeout = 10.0
+
+        # If frontier clusters exist but have no usable goal, first try
+        # small recovery moves before starting the no-frontier countdown.
+        # A 0.3 m goal falls inside Nav2's 0.25 m goal tolerance, so the
+        # controller can report success after barely moving.  Exploration
+        # recovery must travel far enough to reveal a different laser view.
+        self.recovery_distance = 0.8
+        # Return-home recovery is only for getting unstuck before retrying a
+        # known home goal, so keep it deliberately small.
+        self.return_recovery_distance = 0.3
+        self.recovery_directions = [
+            ("forward", 0.0),
+            ("forward-left", math.pi / 4.0),
+            ("left", math.pi / 2.0),
+            ("backward-left", 3.0 * math.pi / 4.0),
+            ("backward", math.pi),
+            ("backward-right", -3.0 * math.pi / 4.0),
+            ("right", -math.pi / 2.0),
+            ("forward-right", -math.pi / 4.0),
+        ]
+        self._recovery_in_progress = False
+        self._recovery_index = 0
+        self._recovery_start_yaw = None
+        self._recovery_start_x = None
+        self._recovery_start_y = None
+        self._frontier_clusters_no_usable_goal = False
+        # A sweep is a single recovery attempt, not a loop.  It is reset
+        # only after a usable frontier is found again.
+        self._recovery_sweep_attempted = False
+
+        # Return-home uses a bounded directional recovery sweep only after
+        # Nav2 has reported failure from its own recovery tree.
+        self._return_recovery_in_progress = False
+        self._return_recovery_index = 0
+        self._return_recovery_start_x = None
+        self._return_recovery_start_y = None
+        self._return_recovery_start_yaw = None
+        self._return_home_retry_after_sec = None
+        self.return_home_map_update_wait_s = 2.0
+
+        # Minimum passage/entrance width that the robot is willing to enter.
+        self.min_passage_width = 0.55  # metres
+
+        # Store the active Nav2 goal handle so it can be canceled.
+        self._goal_handle = None
+        # A DDS/action-server response can be lost during startup or a heavy
+        # map update.  Do not let that leave _goal_in_progress true forever.
+        self.nav_goal_response_timeout_s = 5.0
+        self._nav_goal_response_deadline_sec = None
+        self._nav_goal_response_callback = None
+        self._nav_goal_request_id = 0
+
+        # Minimum distance a frontier goal must have from an obstacle.
+        self.obstacle_clearance = 0.5  # metres
+
+        # Navfn's configured goal tolerance is 0.5 m.  A closer frontier can
+        # produce a zero-length path and an immediate Nav2 success without
+        # moving the robot, so require a small margin beyond that tolerance.
+        self.min_frontier_goal_distance = 0.60  # metres
+
+        self.latest_map: OccupancyGrid | None = None
+        self.map_sub = self.create_subscription(
+            OccupancyGrid, "/map", self._on_map, 10
+        )
+
+        self.path_client = ActionClient(
+            self, ComputePathToPose, "/compute_path_to_pose"
+        )
+
+        self.nav_client = ActionClient(
+            self, NavigateToPose, "/navigate_to_pose"
+        )
+
+        self.finish_client = self.create_client(Trigger, "/finish_exploration")
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.state = "WAITING_FOR_MAP"
+        self._goal_in_progress = False
+
+        # ------------------------------------------------------------
+        # Frontier progress tracking.
+        #
+        # This prevents repeatedly sending the exact same frontier goal
+        # when Nav2 reports success but the map has not changed enough.
+        # ------------------------------------------------------------
+
+        self.current_frontier = None
+        self.current_frontier_distance = float("inf")
+
+        self.last_progress_time = self.get_clock().now()
+
+        # Simulated seconds without meaningful progress before we
+        # abandon the current frontier.
+        self.progress_timeout = 2.0
+
+        # A route beyond this ratio is still usable, but is deprioritized
+        # after its path cost has been measured.
+        self.max_frontier_path_detour_ratio = 2.5
+        self.frontier_path_detours = []
+
+        # Keep the robot moving through one region instead of letting a large
+        # frontier on the opposite side of the map dominate every decision.
+        self.frontier_turnaround_weight = 4.0
+        self.frontier_gain_weight = 0.25
+
+        # Frontiers that repeatedly fail or make no progress.
+        self.frontier_blacklist = []
+
+        self.timer = self.create_timer(1.0, self._tick)
+
+        # Set once we've asked Nav2 to cancel the current goal due to a
+        # narrow gap ahead, so we don't spam cancel_goal_async() every
+        # tick while waiting for that cancellation to be confirmed.
+        self._narrow_gap_cancel_pending = False
+
+        # A large map->odom change is a SLAM pose-graph correction.  Paths
+        # expressed in the previous map frame are no longer trustworthy, so
+        # cancel the in-flight frontier goal and wait for Nav2's costmaps to
+        # incorporate the corrected map before selecting another frontier.
+        self.map_correction_translation_threshold = 0.35  # metres
+        self.map_correction_yaw_threshold = math.radians(15.0)
+        self.map_correction_settle_seconds = 3.0
+        self._last_map_odom_pose = None
+        self._map_settle_until_sec = None
+        self._map_correction_cancel_pending = False
+        self._map_correction_epoch = 0
+
+    def _on_map(self, msg: OccupancyGrid) -> None:
+        self.latest_map = msg
+        self.map_version += 1
+
+    def _now_sec(self) -> float:
+        return self.get_clock().now().nanoseconds / 1e9
+
+    def _map_is_settling(self) -> bool:
+        if self._map_settle_until_sec is None:
+            return False
+
+        if self._now_sec() < self._map_settle_until_sec:
+            return True
+
+        self.get_logger().info(
+            "Map/costmap stabilization window complete; replanning."
+        )
+        self._map_settle_until_sec = None
+        return False
+
+    def _check_for_map_correction(self) -> None:
+        """Detect a large SLAM map->odom correction and invalidate paths."""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "map", "odom", rclpy.time.Time()
+            )
+        except tf2_ros.TransformException:
+            return
+
+        q = tf.transform.rotation
+        current = (
+            tf.transform.translation.x,
+            tf.transform.translation.y,
+            math.atan2(
+                2.0 * (q.w * q.z),
+                1.0 - 2.0 * (q.z * q.z),
+            ),
+        )
+
+        previous = self._last_map_odom_pose
+        self._last_map_odom_pose = current
+
+        # The first transform establishes a baseline, not a correction.
+        if previous is None:
+            return
+
+        translation_change = math.hypot(
+            current[0] - previous[0],
+            current[1] - previous[1],
+        )
+        yaw_change = abs(math.atan2(
+            math.sin(current[2] - previous[2]),
+            math.cos(current[2] - previous[2]),
+        ))
+
+        if (
+            translation_change < self.map_correction_translation_threshold
+            and yaw_change < self.map_correction_yaw_threshold
+        ):
+            return
+
+        self._map_correction_epoch += 1
+        self._map_settle_until_sec = (
+            self._now_sec() + self.map_correction_settle_seconds
+        )
+
+        self.get_logger().warn(
+            "Large map->odom correction detected "
+            f"(translation={translation_change:.2f}m, "
+            f"yaw={math.degrees(yaw_change):.1f}deg). "
+            f"Pausing frontier navigation for "
+            f"{self.map_correction_settle_seconds:.1f}s."
+        )
+
+        had_frontier_goal = (
+            self._goal_in_progress
+            and self.state == "EXPLORING"
+            and self.current_frontier is not None
+        )
+
+        self.current_frontier = None
+        self.current_frontier_distance = float("inf")
+
+        if had_frontier_goal:
+            self._map_correction_cancel_pending = True
+            if self._goal_handle is not None:
+                self.get_logger().info(
+                    "Canceling frontier goal planned before map correction."
+                )
+                self._goal_handle.cancel_goal_async()
+
+    def _check_for_immediate_narrow_passage(self) -> None:
+        """While actively navigating toward a frontier, watch the gap
+        immediately ahead of the robot. If it narrows below
+        min_passage_width, ask Nav2 to cancel the current goal right
+        away rather than waiting for it to push through or fail on
+        its own. The frontier gets blacklisted once the cancellation
+        is confirmed, via the existing success/failure callback in
+        _tick() (a canceled goal reports success=False there, which
+        already blacklists and resets current_frontier).
+        """
+
+        if self._narrow_gap_cancel_pending:
+            # Already asked Nav2 to cancel; wait for that to land
+            # instead of sending duplicate cancel requests every tick.
+            return
+
+        if self.latest_map is None:
+            return
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "map", "base_link", rclpy.time.Time()
+            )
+        except tf2_ros.TransformException:
+            return
+
+        robot_x = tf.transform.translation.x
+        robot_y = tf.transform.translation.y
+
+        q = tf.transform.rotation
+        robot_yaw = math.atan2(
+            2.0 * (q.w * q.z),
+            1.0 - 2.0 * (q.z * q.z)
+        )
+
+        # Check a short distance ahead of the robot's current position,
+        # not its own footprint — by the time the robot is already
+        # inside a narrow gap it's too late to react cleanly.
+        look_ahead = 0.3  # metres
+        ahead_x = robot_x + look_ahead * math.cos(robot_yaw)
+        ahead_y = robot_y + look_ahead * math.sin(robot_yaw)
+
+        width = self.get_cross_section_width(ahead_x, ahead_y, robot_yaw)
+
+        if width is None or width >= self.min_passage_width:
+            return
+
+        self.get_logger().warn(
+            f"Narrow gap ({width:.2f}m) detected immediately ahead "
+            "while en route to the current frontier. Cancelling the "
+            "goal now."
+        )
+
+        self._narrow_gap_cancel_pending = True
+
+        if self._goal_handle is not None:
+            self._goal_handle.cancel_goal_async()
+
+    def _check_nav_goal_response_timeout(self) -> None:
+        """Fail a NavigateToPose request whose goal response never arrives."""
+        deadline = self._nav_goal_response_deadline_sec
+        if deadline is None or self._now_sec() < deadline:
+            return
+
+        callback = self._nav_goal_response_callback
+        self._nav_goal_response_deadline_sec = None
+        self._nav_goal_response_callback = None
+        self._goal_handle = None
+        self._goal_in_progress = False
+        # Invalidate a delayed response before notifying the state machine.
+        self._nav_goal_request_id += 1
+
+        self.get_logger().warn(
+            "NavigateToPose goal response timed out; treating the goal as "
+            "failed so exploration can continue."
+        )
+        if callback is not None:
+            callback(False)
+
+    def estimate_information_gain(
+        self,
+        cluster,
+        width: int,
+        height: int,
+        data,
+    ) -> int:
+        """Rough proxy for how much unknown space this frontier cluster
+        borders, distinct from len(cluster) (which only counts boundary
+        cells, not the unknown area behind them). Counts unique unknown
+        cells adjacent to any cell in the cluster.
+        """
+
+        unknown_neighbors = set()
+
+        for x, y in cluster:
+            i = y * width + x
+
+            for n in (i - 1, i + 1, i - width, i + width):
+                if 0 <= n < len(data) and data[n] == -1:
+                    unknown_neighbors.add(n)
+
+        return len(unknown_neighbors)
+
+    def build_obstacle_distance_map(self):
+        if self.latest_map is None:
+            return None
+
+        msg = self.latest_map
+
+        width = msg.info.width
+        height = msg.info.height
+        resolution = msg.info.resolution
+        data = msg.data
+
+        clearance_cells = math.ceil(
+            self.obstacle_clearance / resolution
+        )
+
+        distance = [-1] * (width * height)
+        queue = deque()
+
+        # Multi-source BFS:
+        # every occupied cell is a source with distance 0.
+        for i, value in enumerate(data):
+            if value > 20:
+                distance[i] = 0
+                queue.append(i)
+
+        while queue:
+
+            i = queue.popleft()
+            d = distance[i]
+
+            # We don't care about distances beyond the required
+            # obstacle clearance.
+            if d >= clearance_cells:
+                continue
+
+            next_d = d + 1
+
+            x = i % width
+            y = i // width
+
+            # Left
+            if x > 0:
+                n = i - 1
+
+                if distance[n] == -1:
+                    distance[n] = next_d
+                    queue.append(n)
+
+            # Right
+            if x < width - 1:
+                n = i + 1
+
+                if distance[n] == -1:
+                    distance[n] = next_d
+                    queue.append(n)
+
+            # Down
+            if y > 0:
+                n = i - width
+
+                if distance[n] == -1:
+                    distance[n] = next_d
+                    queue.append(n)
+
+            # Up
+            if y < height - 1:
+                n = i + width
+
+                if distance[n] == -1:
+                    distance[n] = next_d
+                    queue.append(n)
+
+        return distance
+
+    def get_home_pose_in_map_frame(self) -> PoseStamped | None:
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                "map", "odom", rclpy.time.Time()
+            )
+        except tf2_ros.TransformException as exc:
+            self.get_logger().warn(f"no map->odom transform yet: {exc}")
+            return None
+
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = transform.transform.translation.x
+        pose.pose.position.y = transform.transform.translation.y
+        pose.pose.orientation = transform.transform.rotation
+        return pose
+
+    def compute_global_path_async(
+        self,
+        goal_pose: PoseStamped,
+        on_done
+    ) -> None:
+
+        if not self.path_client.server_is_ready():
+            self.get_logger().warn(
+                "/compute_path_to_pose action server not ready"
+            )
+            on_done(None)
+            return
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "map",
+                "base_link",
+                rclpy.time.Time()
+            )
+        except tf2_ros.TransformException as exc:
+            self.get_logger().warn(
+                f"Could not get robot pose for path planning: {exc}"
+            )
+            on_done(None)
+            return
+
+        goal = ComputePathToPose.Goal()
+
+        goal.goal = goal_pose
+        goal.start = PoseStamped()
+        goal.start.header.frame_id = "map"
+        goal.start.header.stamp = self.get_clock().now().to_msg()
+
+        goal.start.pose.position.x = (
+            tf.transform.translation.x
+        )
+        goal.start.pose.position.y = (
+            tf.transform.translation.y
+        )
+        goal.start.pose.orientation = (
+            tf.transform.rotation
+        )
+
+        goal.planner_id = "GridBased"
+        goal.use_start = True
+
+        send_future = self.path_client.send_goal_async(goal)
+
+        def _goal_response(future):
+
+            try:
+                handle = future.result()
+            except Exception as exc:
+                self.get_logger().error(
+                    f"ComputePathToPose failed: {exc}"
+                )
+                on_done(None)
+                return
+
+            if not handle.accepted:
+                self.get_logger().warn(
+                    "ComputePathToPose goal rejected"
+                )
+                on_done(None)
+                return
+
+            result_future = handle.get_result_async()
+
+            def _result_response(fut):
+
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    self.get_logger().error(
+                        f"Path computation result failed: {exc}"
+                    )
+                    on_done(None)
+                    return
+
+                if result.status != GoalStatus.STATUS_SUCCEEDED:
+                    self.get_logger().warn(
+                        f"Path computation failed, "
+                        f"status={result.status}"
+                    )
+                    on_done(None)
+                    return
+
+                path = result.result.path
+
+                if path is None or not path.poses:
+                    self.get_logger().warn(
+                        "Nav2 returned an empty path"
+                    )
+                    on_done(None)
+                    return
+
+                self.get_logger().debug(
+                    f"Computed global path with "
+                    f"{len(path.poses)} poses"
+                )
+
+                on_done(path)
+
+            result_future.add_done_callback(_result_response)
+
+        send_future.add_done_callback(_goal_response)
+
+    def path_has_narrow_passage(self, path) -> bool:
+        if self.latest_map is None:
+            return False
+
+        poses = path.poses
+
+        # Check every few poses instead of every single one.
+        for i in range(1, len(poses) - 1, 3):
+
+            p = poses[i].pose.position
+            prev = poses[i - 1].pose.position
+            nxt = poses[i + 1].pose.position
+
+            yaw = math.atan2(
+                nxt.y - prev.y,
+                nxt.x - prev.x
+            )
+
+            width = self.get_cross_section_width(
+                p.x,
+                p.y,
+                yaw
+            )
+
+            if (
+                width is not None
+                and width < self.min_passage_width
+            ):
+                self.get_logger().warn(
+                    f"Narrow passage detected: {width:.2f} m"
+                )
+                return True
+
+        return False
+
+    @staticmethod
+    def path_length(path) -> float:
+        """Return the travelled length of a Nav2 Path in metres."""
+        return sum(
+            math.hypot(
+                current.pose.position.x - previous.pose.position.x,
+                current.pose.position.y - previous.pose.position.y,
+            )
+            for previous, current in zip(path.poses, path.poses[1:])
+        )
+
+    def get_cross_section_width(
+        self,
+        x: float,
+        y: float,
+        yaw: float
+    ):
+        if self.latest_map is None:
+            return None
+
+        msg = self.latest_map
+
+        res = msg.info.resolution
+        width = msg.info.width
+        height = msg.info.height
+        ox = msg.info.origin.position.x
+        oy = msg.info.origin.position.y
+        data = msg.data
+
+        perp_x = -math.sin(yaw)
+        perp_y = math.cos(yaw)
+
+        max_scan = 1.0
+
+        def scan(sign):
+
+            d = res
+
+            while d <= max_scan:
+
+                wx = x + sign * perp_x * d
+                wy = y + sign * perp_y * d
+
+                mx = int((wx - ox) / res)
+                my = int((wy - oy) / res)
+
+                if (
+                    mx < 0 or mx >= width
+                    or my < 0 or my >= height
+                ):
+                    # Outside the known map is not considered
+                    # a narrow wall.
+                    return max_scan
+
+                value = data[my * width + mx]
+
+                if value > 20:
+                    return d
+
+                d += res
+
+            return max_scan
+
+        left = scan(+1)
+        right = scan(-1)
+
+        return left + right
+
+    def send_nav_goal(self, pose: PoseStamped, on_done) -> None:
+        if not self.nav_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().error(
+                "/navigate_to_pose action server not available"
+            )
+            on_done(False)
+            return
+
+        goal = NavigateToPose.Goal()
+        goal.pose = pose
+
+        self._goal_in_progress = True
+        self._nav_goal_request_id += 1
+        request_id = self._nav_goal_request_id
+        self._nav_goal_response_deadline_sec = (
+            self._now_sec() + self.nav_goal_response_timeout_s
+        )
+        self._nav_goal_response_callback = on_done
+
+        send_future = self.nav_client.send_goal_async(goal)
+
+        def _on_goal_response(fut):
+            # A response that arrives after the watchdog fired belongs to an
+            # invalidated request and must not revive the old state.
+            if request_id != self._nav_goal_request_id:
+                return
+
+            self._nav_goal_response_deadline_sec = None
+            self._nav_goal_response_callback = None
+
+            try:
+                handle = fut.result()
+            except Exception as exc:
+                self.get_logger().warn(
+                    f"NavigateToPose goal request failed: {exc}"
+                )
+                self._goal_handle = None
+                self._goal_in_progress = False
+                on_done(False)
+                return
+
+            if not handle.accepted:
+                self.get_logger().warn("goal rejected")
+                self._goal_handle = None
+                self._goal_in_progress = False
+                on_done(False)
+                return
+
+            self._goal_handle = handle
+
+            # A map correction can occur between send_goal_async() and this
+            # response.  In that case cancel immediately rather than letting
+            # a stale frontier goal start driving after the settle window.
+            if self._map_correction_cancel_pending:
+                self.get_logger().info(
+                    "Canceling newly accepted stale frontier goal."
+                )
+                handle.cancel_goal_async()
+
+            result_future = handle.get_result_async()
+
+            def _on_result(fut2):
+                if request_id != self._nav_goal_request_id:
+                    return
+
+                status = fut2.result().status
+
+                self._goal_handle = None
+                self._goal_in_progress = False
+
+                on_done(
+                    status == GoalStatus.STATUS_SUCCEEDED
+                )
+
+            result_future.add_done_callback(_on_result)
+
+        send_future.add_done_callback(_on_goal_response)
+
+    def call_finish_exploration(self) -> None:
+        if not self.finish_client.wait_for_service(timeout_sec=5.0):
+            self.get_logger().error(
+                "/finish_exploration service not available"
+            )
+            return
+
+        future = self.finish_client.call_async(
+            Trigger.Request()
+        )
+
+        def _on_response(fut):
+            res = fut.result()
+            self.get_logger().info(
+                f"Session result: {res.message}"
+            )
+
+        future.add_done_callback(_on_response)
+
+    def frontier_is_blacklisted(self, frontier) -> bool:
+        """Return True if this frontier is already known to be bad."""
+
+        for old_frontier in self.frontier_blacklist:
+            distance = math.hypot(
+                frontier[0] - old_frontier[0],
+                frontier[1] - old_frontier[1]
+            )
+
+            # Blacklist radius of 0.5 m.
+            if distance < 0.8:
+                return True
+
+        return False
+
+    def frontier_path_detour_ratio(self, frontier):
+        """Return a previously measured path/direct-distance ratio, if any."""
+        for old_frontier, ratio in self.frontier_path_detours:
+            if math.hypot(
+                frontier[0] - old_frontier[0],
+                frontier[1] - old_frontier[1],
+            ) < 0.8:
+                return ratio
+        return None
+
+    def remember_frontier_path_detour(self, frontier, ratio: float) -> None:
+        """Cache one route-cost measurement for frontier scoring."""
+        for index, (old_frontier, _) in enumerate(self.frontier_path_detours):
+            if math.hypot(
+                frontier[0] - old_frontier[0],
+                frontier[1] - old_frontier[1],
+            ) < 0.8:
+                self.frontier_path_detours[index] = (frontier, ratio)
+                return
+        self.frontier_path_detours.append((frontier, ratio))
+
+    def frontier_is_too_close_to_obstacle(
+        self,
+        x: int,
+        y: int,
+        width: int,
+        height: int,
+        resolution: float,
+        data,
+    ) -> bool:
+        """Return whether a frontier cell is within obstacle clearance."""
+        clearance_cells = math.ceil(self.obstacle_clearance / resolution)
+
+        for dy in range(-clearance_cells, clearance_cells + 1):
+            for dx in range(-clearance_cells, clearance_cells + 1):
+                # Use a circular clearance region rather than a square one.
+                distance = math.hypot(dx * resolution, dy * resolution)
+                if distance > self.obstacle_clearance:
+                    continue
+
+                neighbor_x = x + dx
+                neighbor_y = y + dy
+                if not (0 <= neighbor_x < width and 0 <= neighbor_y < height):
+                    continue
+
+                index = neighbor_y * width + neighbor_x
+                if data[index] > 20:
+                    return True
+
+        return False
+
+    def find_nearest_frontier(self):
+        """Find the best frontier cluster and return an actual goal point."""
+
+        self._frontier_clusters_no_usable_goal = False
+
+        if self.latest_map is None:
+            return None
+
+        if (
+            self.obstacle_distance_map is None
+            or self.obstacle_distance_map_version != self.map_version
+        ):
+            self.get_logger().debug(
+                "Rebuilding obstacle distance map..."
+            )
+
+            self.obstacle_distance_map = (
+                self.build_obstacle_distance_map()
+            )
+
+            self.obstacle_distance_map_version = self.map_version
+
+        distance_map = self.obstacle_distance_map
+
+        msg = self.latest_map
+
+        width = msg.info.width
+        height = msg.info.height
+        resolution = msg.info.resolution
+
+        origin_x = msg.info.origin.position.x
+        origin_y = msg.info.origin.position.y
+
+        data = msg.data
+
+        # ------------------------------------------------------------
+        # Current robot position.
+        # ------------------------------------------------------------
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "map",
+                "base_link",
+                rclpy.time.Time()
+            )
+        except tf2_ros.TransformException:
+            return None
+
+        robot_x = tf.transform.translation.x
+        robot_y = tf.transform.translation.y
+
+        # Robot's current heading, used to mildly favor frontiers that
+        # continue the current direction of travel over ones that
+        # require an about-face — reduces time lost to backtracking
+        # and oscillation between opposite sides of the map.
+        q = tf.transform.rotation
+        robot_yaw = math.atan2(
+            2.0 * (q.w * q.z),
+            1.0 - 2.0 * (q.z * q.z)
+        )
+
+        # ------------------------------------------------------------
+        # 1. Find all frontier cells.
+        # ------------------------------------------------------------
+
+        frontier_cells = set()
+
+        for y in range(1, height - 1):
+            for x in range(1, width - 1):
+
+                i = y * width + x
+
+                # Known free cell.
+                if data[i] < 0 or data[i] > 20:
+                    continue
+
+                neighbors = (
+                    i - 1,
+                    i + 1,
+                    i - width,
+                    i + width,
+                )
+
+                # Must touch unknown space.
+                if not any(data[n] == -1 for n in neighbors):
+                    continue
+
+                # ------------------------------------------------------------
+                # Reject frontiers that are too close to an obstacle.
+                # ------------------------------------------------------------
+
+
+                clearance_cells = math.ceil(
+                    self.obstacle_clearance / resolution
+                )
+
+                if (
+                    distance_map[i] >= 0
+                    and distance_map[i] < clearance_cells
+                ):
+                    continue
+
+                frontier_cells.add((x, y))
+
+        if not frontier_cells:
+            self.get_logger().warn(
+                "No frontier cells detected!"
+            )
+            return None
+
+        self.get_logger().info(
+            f"Detected {len(frontier_cells)} frontier cells"
+        )
+
+        # ------------------------------------------------------------
+        # 2. Cluster frontier cells.
+        # ------------------------------------------------------------
+
+        clusters = []
+        visited = set()
+
+        for start in frontier_cells:
+
+            if start in visited:
+                continue
+
+            cluster = []
+            queue = deque([start])
+            visited.add(start)
+
+            while queue:
+
+                x, y = queue.popleft()
+                cluster.append((x, y))
+
+                # 8-connected clustering.
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+
+                        if dx == 0 and dy == 0:
+                            continue
+
+                        neighbor = (x + dx, y + dy)
+
+                        if (
+                            neighbor in frontier_cells
+                            and neighbor not in visited
+                        ):
+                            visited.add(neighbor)
+                            queue.append(neighbor)
+
+            clusters.append(cluster)
+
+        # ------------------------------------------------------------
+        # 3. Remove tiny clusters.
+        # ------------------------------------------------------------
+
+        MIN_CLUSTER_SIZE = 5
+
+        clusters = [
+            cluster
+            for cluster in clusters
+            if len(cluster) >= MIN_CLUSTER_SIZE
+        ]
+
+        self.get_logger().info(
+            f"Found {len(clusters)} frontier clusters "
+            f"after filtering"
+        )
+
+        if not clusters:
+            return None
+
+        # ------------------------------------------------------------
+        # 4. Find best cluster.
+        # ------------------------------------------------------------
+
+        best_cluster = None
+        best_goal = None
+        best_distance = float("inf")
+        best_score = float("inf")
+
+        for cluster in clusters:
+
+            closest_frontier = None
+            closest_distance = float("inf")
+
+            # --------------------------------------------------------
+            # Find the closest usable frontier CELL.
+            # --------------------------------------------------------
+
+            for x, y in cluster:
+
+                wx = origin_x + (x + 0.5) * resolution
+                wy = origin_y + (y + 0.5) * resolution
+
+                distance = math.hypot(
+                    wx - robot_x,
+                    wy - robot_y
+                )
+
+                # Don't choose a frontier we're already on.
+                if distance <= self.min_frontier_goal_distance:
+                    continue
+
+                # Ignore blacklisted frontier cells.
+                if self.frontier_is_blacklisted(
+                    (wx, wy)
+                ):
+                    continue
+
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_frontier = (wx, wy)
+
+            # No usable cells in this cluster.
+            if closest_frontier is None:
+                continue
+
+            # --------------------------------------------------------
+            # Cluster score.
+            #
+            # Smaller distance = better
+            # Larger cluster = better
+            # --------------------------------------------------------
+
+            gain = self.estimate_information_gain(
+                cluster, width, height, data
+            )
+
+            # A direction reversal is expensive: it usually means returning
+            # along already-covered space.  Penalize it strongly, while still
+            # allowing it when no forward frontier remains.
+            angle_to_goal = math.atan2(
+                closest_frontier[1] - robot_y,
+                closest_frontier[0] - robot_x
+            )
+
+            heading_diff = abs(
+                math.atan2(
+                    math.sin(angle_to_goal - robot_yaw),
+                    math.cos(angle_to_goal - robot_yaw)
+                )
+            )
+
+            heading_penalty = 1.0 + (
+                self.frontier_turnaround_weight
+                * (heading_diff / math.pi) ** 2
+            )
+
+            # Information gain is a bounded tie-breaker.  The old product of
+            # square roots allowed a large distant frontier to overwhelm both
+            # distance and direction, causing branch-to-branch oscillation.
+            gain_bonus = 1.0 + (
+                self.frontier_gain_weight * math.log1p(gain)
+            )
+
+            score = closest_distance * heading_penalty / gain_bonus
+
+            # A previously measured Nav2 detour is a better travel-cost
+            # estimate than straight-line distance.  It does not rule the
+            # frontier out; it simply lets cheaper alternatives win first.
+            cached_detour = self.frontier_path_detour_ratio(closest_frontier)
+            if cached_detour is not None:
+                score *= cached_detour
+
+            self.get_logger().debug(
+                f"Cluster size={len(cluster)}, "
+                f"gain={gain}, "
+                f"distance={closest_distance:.2f}m, "
+                f"heading_penalty={heading_penalty:.2f}, "
+                f"gain_bonus={gain_bonus:.2f}, "
+                f"score={score:.3f}"
+            )
+
+            if score < best_score:
+
+                best_score = score
+                best_cluster = cluster
+                best_goal = closest_frontier
+                best_distance = closest_distance
+
+        # ------------------------------------------------------------
+        # 5. No usable cluster.
+        # ------------------------------------------------------------
+
+        if best_goal is None:
+            self._frontier_clusters_no_usable_goal = True
+            self.get_logger().warn(
+                "Frontier clusters exist, but none have "
+                "a usable goal point."
+            )
+            return None
+
+        self.get_logger().info(
+            f"Selected frontier cluster: "
+            f"size={len(best_cluster)}, "
+            f"goal=({best_goal[0]:.2f}, "
+            f"{best_goal[1]:.2f}), "
+            f"distance={best_distance:.2f}"
+        )
+
+        return best_goal
+
+    def _start_recovery_sweep(self) -> None:
+        """Try one recovery direction, then let frontier selection retry."""
+        if self._recovery_in_progress or self._goal_in_progress:
+            return
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "map", "base_link", rclpy.time.Time()
+            )
+        except tf2_ros.TransformException as exc:
+            self.get_logger().warn(
+                f"Cannot start recovery sweep; no map -> base_link TF: {exc}"
+            )
+            return
+
+        q = tf.transform.rotation
+        yaw = math.atan2(
+            2.0 * (q.w * q.z),
+            1.0 - 2.0 * (q.z * q.z)
+        )
+
+        self._recovery_start_x = tf.transform.translation.x
+        self._recovery_start_y = tf.transform.translation.y
+        self._recovery_start_yaw = yaw
+        self._recovery_in_progress = True
+        self.no_frontier_since = None
+
+        self.get_logger().warn(
+            "Frontier clusters exist but have no usable goal. "
+            f"Trying recovery direction {self._recovery_index + 1}/"
+            f"{len(self.recovery_directions)} before checking again."
+        )
+
+        self._send_next_recovery_move()
+
+    def _recovery_goal_in_map(
+        self, start_x: float, start_y: float, yaw: float
+    ) -> tuple[float, float] | None:
+        """Return the farthest safe, in-map endpoint for a recovery move.
+
+        A freshly published SLAM map can end exactly at the robot's laser
+        boundary.  Sending an unconditional 0.3 m goal can then put the
+        endpoint outside Nav2's global costmap, producing ``worldToMap
+        failed`` before Nav2 can do any useful recovery.  Work backward from
+        the desired endpoint and only use a non-occupied cell contained in
+        the latest map.  Unknown cells remain valid: Navfn is configured to
+        plan through unknown space for frontier exploration.
+        """
+        if self.latest_map is None:
+            return None
+
+        msg = self.latest_map
+        resolution = msg.info.resolution
+        width = msg.info.width
+        height = msg.info.height
+        origin = msg.info.origin
+
+        # OccupancyGrid origins may be rotated.  Transform world coordinates
+        # into that local grid frame before calculating a cell index.
+        origin_q = origin.orientation
+        origin_yaw = math.atan2(
+            2.0 * (origin_q.w * origin_q.z),
+            1.0 - 2.0 * (origin_q.z * origin_q.z),
+        )
+        cos_origin = math.cos(origin_yaw)
+        sin_origin = math.sin(origin_yaw)
+
+        def is_usable(x: float, y: float) -> bool:
+            dx = x - origin.position.x
+            dy = y - origin.position.y
+            map_x = int((cos_origin * dx + sin_origin * dy) / resolution)
+            map_y = int((-sin_origin * dx + cos_origin * dy) / resolution)
+            if not (0 <= map_x < width and 0 <= map_y < height):
+                return False
+            return msg.data[map_y * width + map_x] <= 20
+
+        # Test the requested endpoint first, then shorten it by one map cell
+        # at a time.  A zero-length fallback is intentionally allowed: it
+        # gives Nav2 a valid in-map pose to rotate at instead of an invalid
+        # off-map translation goal.
+        steps = max(1, math.ceil(self.recovery_distance / resolution))
+        for step in range(steps, -1, -1):
+            distance = min(self.recovery_distance, step * resolution)
+            goal_x = start_x + distance * math.cos(yaw)
+            goal_y = start_y + distance * math.sin(yaw)
+            if is_usable(goal_x, goal_y):
+                return goal_x, goal_y
+
+        return None
+
+    def _send_next_recovery_move(self) -> None:
+        """Send the next recovery goal."""
+        if not self._recovery_in_progress:
+            return
+
+        name, relative_angle = self.recovery_directions[self._recovery_index]
+
+        # Each attempt is relative to the robot's current pose.  If it did
+        # not expose a usable frontier, the next attempt uses the next
+        # direction after frontier selection has had a chance to run.
+        yaw = self._recovery_start_yaw + relative_angle
+        goal = self._recovery_goal_in_map(
+            self._recovery_start_x, self._recovery_start_y, yaw
+        )
+
+        if goal is None:
+            self.get_logger().warn(
+                f"Skipping recovery move '{name}': no usable in-map "
+                "endpoint is available yet."
+            )
+            self._recovery_index += 1
+            self._recovery_in_progress = False
+            self._recovery_start_x = None
+            self._recovery_start_y = None
+            self._recovery_start_yaw = None
+            if self._recovery_index >= len(self.recovery_directions):
+                self._recovery_sweep_attempted = True
+            return
+
+        goal_x, goal_y = goal
+
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = goal_x
+        pose.pose.position.y = goal_y
+        pose.pose.orientation = yaw_to_quaternion(yaw)
+
+        self.get_logger().info(
+            f"Recovery move {self._recovery_index + 1}/"
+            f"{len(self.recovery_directions)}: "
+            f"{name}, {self.recovery_distance:.1f} m -> "
+            f"({goal_x:.2f}, {goal_y:.2f})"
+        )
+
+        def _on_done(success: bool) -> None:
+            name_done = self.recovery_directions[self._recovery_index][0]
+
+            if success:
+                self.get_logger().info(
+                    f"Recovery move '{name_done}' succeeded."
+                )
+            else:
+                self.get_logger().warn(
+                    f"Recovery move '{name_done}' failed; "
+                    "checking frontiers before the next direction."
+                )
+
+            self._recovery_index += 1
+            self._recovery_in_progress = False
+            self._recovery_start_x = None
+            self._recovery_start_y = None
+            self._recovery_start_yaw = None
+
+            if self._recovery_index >= len(self.recovery_directions):
+                self._recovery_sweep_attempted = True
+                self.get_logger().info(
+                    "All recovery directions tried; starting the "
+                    f"{self.no_frontier_timeout:.1f}s countdown."
+                )
+
+        self.send_nav_goal(pose, _on_done)
+
+    def _start_return_home_recovery_sweep(self) -> None:
+        """Try one direction, then retry home before trying the next."""
+        if self._return_recovery_in_progress or self._goal_in_progress:
+            return
+
+        if self._return_recovery_index >= len(self.recovery_directions):
+            self.get_logger().error(
+                "Return-home recovery sweep exhausted; ending the session "
+                "with the robot away from home."
+            )
+            self.state = "FINISHING"
+            return
+
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "map", "base_link", rclpy.time.Time()
+            )
+        except tf2_ros.TransformException as exc:
+            self.get_logger().warn(
+                "Cannot start return-home recovery; "
+                f"no map -> base_link TF: {exc}"
+            )
+            return
+
+        q = tf.transform.rotation
+        self._return_recovery_start_x = tf.transform.translation.x
+        self._return_recovery_start_y = tf.transform.translation.y
+        self._return_recovery_start_yaw = math.atan2(
+            2.0 * (q.w * q.z), 1.0 - 2.0 * (q.z * q.z)
+        )
+        self._return_recovery_in_progress = True
+
+        self.get_logger().warn(
+            "Nav2 could not reach home. Trying recovery "
+            f"direction {self._return_recovery_index + 1}/"
+            f"{len(self.recovery_directions)} before retrying home."
+        )
+        self._send_next_return_home_recovery_move()
+
+    def _send_next_return_home_recovery_move(self) -> None:
+        if not self._return_recovery_in_progress:
+            return
+
+        name, relative_angle = self.recovery_directions[
+            self._return_recovery_index
+        ]
+        yaw = self._return_recovery_start_yaw + relative_angle
+        goal_x = self._return_recovery_start_x + (
+            self.return_recovery_distance * math.cos(yaw)
+        )
+        goal_y = self._return_recovery_start_y + (
+            self.return_recovery_distance * math.sin(yaw)
+        )
+
+        pose = PoseStamped()
+        pose.header.frame_id = "map"
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = goal_x
+        pose.pose.position.y = goal_y
+        pose.pose.orientation = yaw_to_quaternion(yaw)
+
+        self.get_logger().info(
+            f"Return-home recovery move {self._return_recovery_index + 1}/"
+            f"{len(self.recovery_directions)}: {name}, "
+            f"{self.return_recovery_distance:.1f} m"
+        )
+
+        def _on_done(success: bool) -> None:
+            if not success:
+                self.get_logger().warn(
+                    f"Return-home recovery move '{name}' failed; "
+                    "retrying home before the next direction."
+                )
+            self._return_recovery_index += 1
+            self._return_recovery_in_progress = False
+            self._return_recovery_start_x = None
+            self._return_recovery_start_y = None
+            self._return_recovery_start_yaw = None
+            # Give SLAM and Nav2's global costmap time to ingest the scan
+            # gathered while making this recovery motion.
+            self._return_home_retry_after_sec = (
+                self._now_sec() + self.return_home_map_update_wait_s
+            )
+
+        self.send_nav_goal(pose, _on_done)
+
+    def _tick(self) -> None:
+
+        # ============================================================
+        # WAITING FOR MAP
+        # ============================================================
+
+        if self.state == "WAITING_FOR_MAP":
+
+            if self.latest_map is not None:
+                self.get_logger().info(
+                    "Got first /map."
+                )
+
+                self.state = "EXPLORING"
+
+            return
+
+        self._check_for_map_correction()
+
+        self._check_nav_goal_response_timeout()
+
+        if self._map_is_settling():
+            return
+
+        # ============================================================
+        # EXPLORING
+        # ============================================================
+
+        if self.state == "EXPLORING":
+
+            # --------------------------------------------------------
+            # The path was checked BEFORE NavigateToPose was sent.
+            # --------------------------------------------------------
+
+            if self._goal_in_progress:
+
+                # Only relevant while actively driving toward a
+                # frontier — current_frontier is None during a
+                # return-home goal, so this can't interfere with that.
+                if self.current_frontier is not None:
+                    self._check_for_immediate_narrow_passage()
+
+                return
+
+            # --------------------------------------------------------
+            # A ComputePathToPose request is currently running.
+            #
+            # Wait for its callback.
+            # --------------------------------------------------------
+
+            if self._path_check_in_progress:
+                return
+
+            if self._recovery_in_progress:
+                return
+
+            # --------------------------------------------------------
+            # Find the best frontier.
+            # --------------------------------------------------------
+
+            frontier = self.find_nearest_frontier()
+
+
+            if frontier is not None:
+                self.no_frontier_since = None
+                self._recovery_sweep_attempted = False
+                self._recovery_index = 0
+
+            # --------------------------------------------------------
+            # No frontier found.
+            # --------------------------------------------------------
+
+            if frontier is None:
+
+                # Before treating the map as complete, try the directional
+                # recovery sweep even when no frontier cells exist yet.  A
+                # stationary robot's initial laser scan can be too sparse to
+                # form a usable frontier; moving exposes the next map area.
+                # Only after all eight directions have had an intervening
+                # retry do we begin the no-frontier countdown.
+                if not self._recovery_sweep_attempted:
+                    self._start_recovery_sweep()
+                    return
+
+                now = self.get_clock().now()
+
+                if self.no_frontier_since is None:
+
+                    self.no_frontier_since = now
+
+                    self.get_logger().info(
+                        "No usable frontier found. "
+                        f"Waiting up to "
+                        f"{self.no_frontier_timeout:.1f}s "
+                        "for the map to update."
+                    )
+
+                    return
+
+                elapsed = (
+                    now - self.no_frontier_since
+                ).nanoseconds / 1e9
+
+                if elapsed < self.no_frontier_timeout:
+
+                    self.get_logger().debug(
+                        f"No frontier for {elapsed:.1f}s "
+                        f"(timeout="
+                        f"{self.no_frontier_timeout:.1f}s)"
+                    )
+
+                    return
+
+                self.get_logger().info(
+                    "No usable frontier found for "
+                    f"{self.no_frontier_timeout:.1f}s. "
+                    "Exploration complete; returning home."
+                )
+
+                self.state = "RETURNING"
+                self.no_frontier_since = None
+
+                return
+
+            # --------------------------------------------------------
+            # Frontier coordinates.
+            # --------------------------------------------------------
+
+            x, y = frontier
+
+            # --------------------------------------------------------
+            # Get current robot pose.
+            # --------------------------------------------------------
+
+            try:
+
+                tf = self.tf_buffer.lookup_transform(
+                    "map",
+                    "base_link",
+                    rclpy.time.Time()
+                )
+
+            except tf2_ros.TransformException as exc:
+
+                self.get_logger().debug(
+                    f"Waiting for map -> base_link TF: {exc}"
+                )
+
+                return
+
+            robot_x = tf.transform.translation.x
+            robot_y = tf.transform.translation.y
+
+            distance = math.hypot(
+                x - robot_x,
+                y - robot_y
+            )
+
+            # --------------------------------------------------------
+            # Ignore frontiers that are essentially under the robot.
+            # --------------------------------------------------------
+
+            if distance <= self.min_frontier_goal_distance:
+
+                self.get_logger().info(
+                    f"Skipping frontier at "
+                    f"({x:.2f}, {y:.2f}) because it is "
+                    f"too close to the robot: {distance:.2f}m"
+                )
+
+                return
+
+            now = self.get_clock().now()
+
+            # --------------------------------------------------------
+            # Check whether this is the same frontier we were
+            # previously working on.
+            # --------------------------------------------------------
+
+            same_frontier = False
+
+            if self.current_frontier is not None:
+
+                same_frontier = (
+                    math.hypot(
+                        x - self.current_frontier[0],
+                        y - self.current_frontier[1]
+                    ) < 0.5
+                )
+
+            # --------------------------------------------------------
+            # NEW FRONTIER
+            # --------------------------------------------------------
+
+            if not same_frontier:
+
+                self.current_frontier = frontier
+                self.current_frontier_distance = distance
+                self.last_progress_time = now
+
+            # --------------------------------------------------------
+            # SAME FRONTIER
+            # --------------------------------------------------------
+
+            else:
+
+                # ----------------------------------------------------
+                # Meaningful progress.
+                # ----------------------------------------------------
+
+                if (
+                    distance
+                    < self.current_frontier_distance - 0.10
+                ):
+
+                    self.current_frontier_distance = distance
+                    self.last_progress_time = now
+
+                    self.get_logger().info(
+                        f"Progress toward frontier: "
+                        f"{distance:.2f} m"
+                    )
+
+                # ----------------------------------------------------
+                # No meaningful progress.
+                #
+                # Use a reasonably generous timeout because SLAM may
+                # need time to publish a changed map.
+                # ----------------------------------------------------
+
+                else:
+
+                    elapsed = (
+                        now - self.last_progress_time
+                    ).nanoseconds / 1e9
+
+                    if elapsed > self.progress_timeout:
+
+                        self.get_logger().warn(
+                            f"No progress toward frontier "
+                            f"({x:.2f}, {y:.2f}) for "
+                            f"{elapsed:.1f}s. "
+                            "Blacklisting it."
+                        )
+
+                        self.frontier_blacklist.append(
+                            frontier
+                        )
+
+                        self.current_frontier = None
+                        self.current_frontier_distance = float("inf")
+                        self.last_progress_time = now
+
+                        return
+
+                    # ------------------------------------------------
+                    # We already attempted this frontier and are
+                    # waiting for the map/frontier structure to change.
+                    # ------------------------------------------------
+
+                    self.get_logger().debug(
+                        f"Waiting for map update around frontier "
+                        f"({x:.2f}, {y:.2f})"
+                    )
+
+                    return
+
+            # --------------------------------------------------------
+            # Construct NavigateToPose goal.
+            # --------------------------------------------------------
+
+            pose = PoseStamped()
+
+            pose.header.frame_id = "map"
+            pose.header.stamp = now.to_msg()
+
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+
+            # Face toward the unexplored region.
+            yaw = math.atan2(
+                y - robot_y,
+                x - robot_x
+            )
+
+            pose.pose.orientation = yaw_to_quaternion(yaw)
+
+            # --------------------------------------------------------
+            # Remember exactly which frontier this path belongs to.
+            #
+            # This prevents an old asynchronous callback from sending
+            # a navigation goal for a frontier that is no longer valid.
+            # --------------------------------------------------------
+
+            frontier_being_checked = frontier
+            path_check_epoch = self._map_correction_epoch
+
+            self._path_check_in_progress = True
+
+            self.get_logger().info(
+                f"Checking global path to frontier "
+                f"({x:.2f}, {y:.2f}), "
+                f"distance={distance:.2f}m"
+            )
+
+            # --------------------------------------------------------
+            # Path result callback.
+            # --------------------------------------------------------
+
+            def _on_path_ready(path):
+
+                self._path_check_in_progress = False
+
+                if path_check_epoch != self._map_correction_epoch:
+                    self.get_logger().debug(
+                        "Discarding path computed before map correction."
+                    )
+                    return
+
+                # ----------------------------------------------------
+                # Make sure this callback still belongs to the current
+                # frontier.
+                # ----------------------------------------------------
+
+                if self.current_frontier is None:
+
+                    self.get_logger().debug(
+                        "Path result arrived after frontier was cleared."
+                    )
+
+                    return
+
+                if (
+                    math.hypot(
+                        frontier_being_checked[0]
+                        - self.current_frontier[0],
+
+                        frontier_being_checked[1]
+                        - self.current_frontier[1]
+                    ) > 0.5
+                ):
+
+                    self.get_logger().debug(
+                        "Discarding stale path result."
+                    )
+
+                    return
+
+                # ----------------------------------------------------
+                # Nav2 could not find a path.
+                # ----------------------------------------------------
+
+                if path is None:
+
+                    self.get_logger().warn(
+                        f"No global path to frontier "
+                        f"({frontier_being_checked[0]:.2f}, "
+                        f"{frontier_being_checked[1]:.2f}). "
+                        "Blacklisting."
+                    )
+
+                    self.frontier_blacklist.append(
+                        frontier_being_checked
+                    )
+
+                    self.current_frontier = None
+                    self.current_frontier_distance = float("inf")
+
+                    return
+
+                # ----------------------------------------------------
+                # Inspect the actual Nav2 path.
+                # ----------------------------------------------------
+
+                nav_path_length = self.path_length(path)
+                direct_distance = max(distance, 0.01)
+                detour_ratio = nav_path_length / direct_distance
+
+                self.get_logger().info(
+                    f"Nav2 path to frontier is {nav_path_length:.2f}m "
+                    f"(straight-line={direct_distance:.2f}m, "
+                    f"detour={detour_ratio:.1f}x)"
+                )
+
+                if nav_path_length < 0.05:
+                    self.get_logger().warn(
+                        f"Rejecting frontier "
+                        f"({frontier_being_checked[0]:.2f}, "
+                        f"{frontier_being_checked[1]:.2f}): "
+                        "Nav2 returned a zero-length path, so it would "
+                        "not move the robot."
+                    )
+
+                    self.frontier_blacklist.append(
+                        frontier_being_checked
+                    )
+
+                    self.current_frontier = None
+                    self.current_frontier_distance = float("inf")
+
+                    return
+
+                cached_detour = self.frontier_path_detour_ratio(
+                    frontier_being_checked
+                )
+                self.remember_frontier_path_detour(
+                    frontier_being_checked, detour_ratio
+                )
+
+                if (
+                    detour_ratio > self.max_frontier_path_detour_ratio
+                    and cached_detour is None
+                ):
+                    self.get_logger().info(
+                        f"Deferring frontier "
+                        f"({frontier_being_checked[0]:.2f}, "
+                        f"{frontier_being_checked[1]:.2f}): "
+                        f"its {detour_ratio:.1f}x Nav2 detour has been "
+                        "added as a score penalty, not blacklisted."
+                    )
+                    self.current_frontier = None
+                    self.current_frontier_distance = float("inf")
+                    return
+
+                if self.path_has_narrow_passage(path):
+
+                    self.get_logger().warn(
+                        f"Rejecting frontier "
+                        f"({frontier_being_checked[0]:.2f}, "
+                        f"{frontier_being_checked[1]:.2f}): "
+                        "global path contains a narrow passage."
+                    )
+
+                    self.frontier_blacklist.append(
+                        frontier_being_checked
+                    )
+
+                    self.current_frontier = None
+                    self.current_frontier_distance = float("inf")
+
+                    return
+
+                # ----------------------------------------------------
+                # Path is acceptable.
+                #
+                # Now send NavigateToPose.
+                # ----------------------------------------------------
+
+                self.get_logger().info(
+                    f"Global path accepted. "
+                    f"Navigating to frontier "
+                    f"({frontier_being_checked[0]:.2f}, "
+                    f"{frontier_being_checked[1]:.2f})"
+                )
+
+                def _on_done(
+                    success: bool,
+                    goal=frontier_being_checked
+                ):
+
+                    self.get_logger().info(
+                        f"Frontier goal finished: "
+                        f"success={success}"
+                    )
+
+                    # ------------------------------------------------
+                    # Failed navigation.
+                    # ------------------------------------------------
+
+                    if self._map_correction_cancel_pending:
+                        self.get_logger().info(
+                            "Discarding frontier result after map correction; "
+                            "not blacklisting it."
+                        )
+                        self._map_correction_cancel_pending = False
+                        self.current_frontier = None
+                        self.current_frontier_distance = float("inf")
+                        return
+
+                    if not success:
+
+                        self.get_logger().warn(
+                            f"Blacklisting failed frontier "
+                            f"({goal[0]:.2f}, {goal[1]:.2f})"
+                        )
+
+                        self.frontier_blacklist.append(
+                            goal
+                        )
+
+                        self.current_frontier = None
+                        self.current_frontier_distance = float("inf")
+                        self.last_progress_time = (
+                            self.get_clock().now()
+                        )
+
+                        return
+
+                    # ------------------------------------------------
+                    # Navigation succeeded.
+                    #
+                    # Keep the frontier temporarily so that we don't
+                    # immediately repeat it.
+                    #
+                    # The next find_nearest_frontier() call will normally
+                    # select a newly exposed frontier after SLAM updates.
+                    # ------------------------------------------------
+
+                    self.last_progress_time = (
+                        self.get_clock().now()
+                    )
+
+                    # Clear the completed frontier so the next tick treats
+                    # whatever find_nearest_frontier() returns as a genuinely
+                    # new goal. Leaving current_frontier set here means the
+                    # next (very likely nearby) frontier gets compared against
+                    # this already-reached point, is judged "no progress",
+                    # and gets stalled for progress_timeout then wrongly
+                    # blacklisted — on essentially every successful arrival.
+                    self.current_frontier = None
+                    self.current_frontier_distance = float("inf")
+
+                    self.get_logger().info(
+                        "Reached frontier. "
+                        "Waiting for the map to expose new frontiers."
+                    )
+
+                self.send_nav_goal(
+                    pose,
+                    _on_done
+                )
+
+            # --------------------------------------------------------
+            # Start asynchronous path computation.
+            # --------------------------------------------------------
+
+            self.compute_global_path_async(
+                pose,
+                _on_path_ready
+            )
+
+            return
+
+        # ============================================================
+        # RETURNING HOME
+        # ============================================================
+
+        if self.state == "RETURNING":
+
+            if self._goal_in_progress:
+                # Nav2 owns the active home goal and its own recovery tree.
+                # Do not cancel it mid-spin or mid-backup: that prevents
+                # Nav2 from reporting a meaningful final result.
+                return
+
+            if self._return_recovery_in_progress:
+                return
+
+            if self._return_home_retry_after_sec is not None:
+                if self._now_sec() < self._return_home_retry_after_sec:
+                    return
+                self._return_home_retry_after_sec = None
+
+            # IMPORTANT:
+            #
+            # Recalculate home every time.
+            # slam_toolbox can change map -> odom while exploring.
+            #
+            home = self.get_home_pose_in_map_frame()
+
+            if home is None:
+                return
+
+            # Home is re-derived immediately before each retry, since SLAM
+            # may have changed the map -> odom transform during recovery.
+
+            def _on_done(success: bool) -> None:
+
+                self.get_logger().info(
+                    f"return-home goal finished, "
+                    f"success={success}"
+                )
+
+                if success:
+                    self.state = "FINISHING"
+                    return
+
+                # Nav2 exhausted its own recovery tree. Try one bounded
+                # directional recovery move, then retry home after the map
+                # and costmap have had time to update.
+                self._start_return_home_recovery_sweep()
+
+            self.send_nav_goal(
+                home,
+                _on_done
+            )
+
+            return
+
+        # ============================================================
+        # FINISHING
+        # ============================================================
+
+        if self.state == "FINISHING":
+
+            self.state = "DONE"
+
+            self.call_finish_exploration()
+
+            return
+
+        # ============================================================
+        # DONE
+        # ============================================================
+
+        # DONE: nothing left to do.
+
+
+def main() -> None:
+    rclpy.init()
+
+    node = ExplorerNode()
+
+    try:
+        rclpy.spin(node)
+
+    except KeyboardInterrupt:
+        pass
+
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
